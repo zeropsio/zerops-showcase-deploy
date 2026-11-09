@@ -27,13 +27,11 @@ ZEROPS_HTTP_STATUS=""
 # ---------------------------------------------------------------------------
 
 slugify() {
-    local input="$1"
-    echo "$input" \
-        | tr '[:upper:]' '[:lower:]' \
-        | sed 's/[^a-z0-9]/-/g' \
-        | sed 's/--*/-/g' \
-        | sed 's/^-//;s/-$//' \
-        | cut -c1-25
+    local input="$1" slug digest
+    slug=$(printf '%s' "$input" | tr '[:upper:]' '[:lower:]' |
+        sed 's/[^a-z0-9]/-/g;s/--*/-/g;s/^-//;s/-$//' | cut -c1-25)
+    digest=$(printf '%s' "$input" | sha256sum)
+    printf '%s-%s\n' "${slug:-branch}" "${digest:0:10}"
 }
 
 log() { echo "::group::$*" >&2; }
@@ -252,12 +250,9 @@ zerops_find_project() {
 
     if [[ "$ZEROPS_HTTP_STATUS" -ge 200 && "$ZEROPS_HTTP_STATUS" -lt 300 ]]; then
         # API returns {"projects":[...]} — extract first match by exact name
-        PROJECT_FOUND_ID=$(echo "$ZEROPS_RESPONSE" | jq -r '
-            if .projects then
-                (.projects[0].id // empty)
-            else
-                (.id // empty)
-            end')
+        PROJECT_FOUND_ID=$(printf '%s' "$ZEROPS_RESPONSE" | jq -r --arg name "$project_name" '
+            [(.projects // [.])[] | select(.name == $name)] |
+            if length > 1 then error("Ambiguous project name") else .[0].id // empty end')
         return 0
     fi
 
@@ -276,6 +271,7 @@ zerops_import_project() {
     local client_id="$1"
     local project_name="$2"
     local yaml_source="${3:-}"
+    zerops_project_marker || return 1
 
     local yaml_content
     if [[ -n "${RENDERED_YAML:-}" ]]; then
@@ -299,6 +295,17 @@ zerops_import_project() {
     if [[ "$ZEROPS_HTTP_STATUS" -ge 200 && "$ZEROPS_HTTP_STATUS" -lt 300 ]]; then
         IMPORTED_PROJECT_ID=$(echo "$ZEROPS_RESPONSE" | jq -r '.projectId')
         info "Project created: ${IMPORTED_PROJECT_ID}"
+        # Import YAML ignores tagList. Persist ownership via the project API.
+        zerops_project_marker || return 1
+        local marker_body
+        marker_body=$(jq -cn --arg name "$project_name" --argjson tags "$PROJECT_TAG_LIST" \
+            '{name:$name,tagList:$tags}')
+        zerops_api PUT "/project/${IMPORTED_PROJECT_ID}" "$marker_body"
+        if [[ "$ZEROPS_HTTP_STATUS" -lt 200 || "$ZEROPS_HTTP_STATUS" -ge 300 ]]; then
+            err "Project created but ownership tagging failed: ${IMPORTED_PROJECT_ID}"
+            return 1
+        fi
+        zerops_assert_owned "$ZEROPS_RESPONSE" false || return 1
         return 0
     fi
 
@@ -311,6 +318,12 @@ zerops_import_project() {
 # Deletes a project by ID. Ignores 404 (already deleted).
 zerops_delete_project() {
     local project_id="$1"
+    zerops_get_project "$project_id"
+    zerops_assert_owned "$ZEROPS_RESPONSE" true || return 1
+    if [[ "${ZEROPS_DELETE_DRY_RUN:-false}" == true ]]; then
+        info "Dry run: would delete owned preview ${project_id}"
+        return 0
+    fi
 
     info "Deleting project ${project_id}..."
     zerops_api DELETE "/project/${project_id}"
@@ -432,41 +445,43 @@ zerops_find_service() {
     exit 1
 }
 
-# zerops_get_subdomain_url PROJECT_ID SERVICE_NAME
-# Sets SUBDOMAIN_URL global.
-# The publicZone field returns the internal .prg1-zerops.zone domain.
-# The public-facing URL uses .zerops.app instead.
+# zerops_enable_subdomain SERVICE_ID
+# Imports without an initial build may leave public access disabled.
+zerops_enable_subdomain() {
+    local service_id="$1"
+    zerops_api GET "/service-stack/$service_id"
+    [[ "$ZEROPS_HTTP_STATUS" == 200 ]] || { err "Cannot read app access"; return 1; }
+    [[ $(jq -r '.subdomainAccess' <<< "$ZEROPS_RESPONSE") != true ]] || return 0
+    zerops_api PUT "/service-stack/$service_id/enable-subdomain-access" '{}'
+    [[ "$ZEROPS_HTTP_STATUS" -ge 200 && "$ZEROPS_HTTP_STATUS" -lt 300 ]] ||
+        { err "Cannot enable app subdomain: HTTP $ZEROPS_HTTP_STATUS"; return 1; }
+    zerops_poll_process "$(jq -er '.id' <<< "$ZEROPS_RESPONSE")" 300
+}
+
+# zerops_get_subdomain_url PROJECT_ID SERVICE_NAME [HTTP_PORT]
+# Public URLs use zeropsSubdomainHost, not the private publicZone label.
 zerops_get_subdomain_url() {
-    local project_id="$1"
-    local service_name="$2"
-    SUBDOMAIN_URL=""
-
+    local project_id="$1" service_name="$2" port="${3:-}"
+    local public_zone public_host region
+    export SUBDOMAIN_URL=""
     zerops_get_project "$project_id"
-    local project_json="$ZEROPS_RESPONSE"
-    local public_zone
-    public_zone=$(echo "$project_json" | jq -r '.publicZone // empty')
-
-    if [[ -n "$public_zone" ]]; then
-        # Convert internal zone (*.prg1-zerops.zone) to public (*.prg1.zerops.app)
-        local public_host
-        public_host="${public_zone/-zerops.zone/.zerops.app}"
-        # shellcheck disable=SC2034
-        SUBDOMAIN_URL="https://${service_name}-${public_host}"
-        return 0
+    public_zone=$(jq -er '.publicZone' <<< "$ZEROPS_RESPONSE")
+    public_host=$(jq -er '.zeropsSubdomainHost' <<< "$ZEROPS_RESPONSE")
+    region="${public_zone#*.}"
+    region="${region%-zerops.zone}"
+    zerops_find_service "$project_id" "$service_name"
+    [[ $(jq -r '.subdomainAccess' <<< "$ZEROPS_RESPONSE") == true ]] ||
+        { err "Service public subdomain is disabled"; return 1; }
+    if [[ -z "$port" ]]; then
+        port=$(jq -er '[.ports[] | select(.scheme == "http" or .scheme == "https")][0].port' <<< "$ZEROPS_RESPONSE")
     fi
-
-    # Fallback: query service stack directly
-    zerops_api GET "/service-stack-by-name/${project_id}/${service_name}"
-    if [[ "$ZEROPS_HTTP_STATUS" -ge 200 && "$ZEROPS_HTTP_STATUS" -lt 300 ]]; then
-        local subdomain
-        subdomain=$(echo "$ZEROPS_RESPONSE" | jq -r '.subdomainAccess // .customSubdomain // empty')
-        if [[ -n "$subdomain" ]]; then
-            # shellcheck disable=SC2034
-            SUBDOMAIN_URL="https://${subdomain}"
-        fi
+    jq -e --argjson port "$port" '.ports | any(.port == $port and (.scheme == "http" or .scheme == "https"))' \
+        <<< "$ZEROPS_RESPONSE" >/dev/null || { err "No matching HTTP port"; return 1; }
+    if [[ "$port" == 80 ]]; then
+        SUBDOMAIN_URL="https://${service_name}-${public_host}.${region}.zerops.app"
+    else
+        SUBDOMAIN_URL="https://${service_name}-${public_host}-${port}.${region}.zerops.app"
     fi
-
-    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -620,12 +635,14 @@ zerops_ensure_project() {
 
     if [[ -n "$PROJECT_FOUND_ID" ]]; then
         PROJECT_ID="$PROJECT_FOUND_ID"
+        zerops_get_project "$PROJECT_ID"
+        zerops_assert_owned "$ZEROPS_RESPONSE" false || return 1
         info "Project '${project_name}' already exists: ${PROJECT_ID}"
         return 0
     fi
 
     info "Project '${project_name}' not found, creating..."
-    zerops_import_project "$client_id" "$project_name" "$import_yaml_file"
+    zerops_import_project "$client_id" "$project_name" "$import_yaml_file" || return 1
     PROJECT_ID="$IMPORTED_PROJECT_ID"
 
     zerops_wait_ready "$PROJECT_ID" "$wait_timeout"
@@ -646,5 +663,44 @@ zerops_delete_project_by_name() {
         return 0
     fi
 
-    zerops_delete_project "$PROJECT_FOUND_ID"
+    ZEROPS_DELETE_DRY_RUN="${3:-${ZEROPS_DELETE_DRY_RUN:-false}}" zerops_delete_project "$PROJECT_FOUND_ID"
+}
+
+# Ownership is stored in project tags, including persistent environments.
+# The ref is base64url so branch names remain a single unambiguous tag.
+zerops_project_marker() {
+    : "${ZEROPS_OWNER_REPOSITORY:?Set the owning GitHub repository}"
+    : "${ZEROPS_ENV_KIND:?Set branch, pr, stage or prod}"
+    : "${ZEROPS_ENV_REF:?Set the branch, PR number or release ref}"
+    case "$ZEROPS_ENV_KIND" in branch|pr|stage|prod) ;; *) err "Invalid environment kind"; return 1 ;; esac
+    local encoded
+    encoded=$(printf '%s' "$ZEROPS_ENV_REF" | base64 | tr -d '\n=' | tr '+/' '-_')
+    PROJECT_TAG_LIST=$(jq -cn --arg owner "showcase-owner:$ZEROPS_OWNER_REPOSITORY" \
+        --arg kind "showcase-kind:$ZEROPS_ENV_KIND" --arg ref "showcase-ref:$encoded" \
+        --arg created "showcase-created:$(date +%s)" '[$owner,$kind,$ref,$created]')
+}
+
+zerops_assert_owned() {
+    local project="$1" deleting="${2:-false}" name kind ref
+    zerops_project_marker || return 1
+    name=$(printf '%s' "$project" | jq -r '.name')
+    if [[ "$deleting" == true ]]; then
+        case "$name" in stage|prod|*-stage|*-prod) err "Protected project: $name"; return 1 ;; esac
+        case ",${ZEROPS_PROTECTED_NAMES:-}," in *",$name,"*) err "Protected project: $name"; return 1 ;; esac
+        case "$ZEROPS_ENV_KIND" in branch|pr) ;; *) err "Only previews may be deleted"; return 1 ;; esac
+    fi
+    kind="showcase-kind:$ZEROPS_ENV_KIND"
+    ref=$(printf '%s' "$PROJECT_TAG_LIST" | jq -r '.[2]')
+    if ! printf '%s' "$project" | jq -e --arg owner "showcase-owner:$ZEROPS_OWNER_REPOSITORY" \
+        --arg kind "$kind" --arg ref "$ref" '
+        (.tagList // []) as $tags |
+        [$tags[] | select(startswith("showcase-owner:"))] == [$owner] and
+        [$tags[] | select(startswith("showcase-kind:"))] == [$kind] and
+        [$tags[] | select(startswith("showcase-ref:"))] == [$ref] and
+        ([$tags[] | select(startswith("showcase-created:"))] |
+          length == 1 and (.[0] | test("^showcase-created:[0-9]{1,12}$")))
+        ' >/dev/null; then
+        err "Refusing project without matching repository/environment ownership: $name"
+        return 1
+    fi
 }

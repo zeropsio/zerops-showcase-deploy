@@ -1,32 +1,17 @@
-# Zerops Showcase — CI/CD Pipeline
-# Copy this file to .github/workflows/deploy.yml in the deployment orchestration repo.
-#
-# Manages 4 environment tiers:
-#   production  — push to main / tag v*         → showcase-prod       (permanent)
-#   stage       — MR merged into stage          → showcase-stage      (permanent)
-#   MR staging  — MR opened/updated → stage     → showcase-mr-{N}     (ephemeral)
-#   dev         — push to feature branch        → showcase-dev-{slug} (ephemeral)
-#
-# Required secrets: ZEROPS_TOKEN, ZEROPS_CLIENT_ID
-# Optional secrets: REPO_TOKEN (PAT with repo read, if service repos are private)
-
 name: Deploy to Zerops
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+    types: [opened, reopened, synchronize, closed]
+    branches: [stage]
+  delete:
 
 permissions:
   contents: read
   pull-requests: write
-
-on:
-  push:
-    branches:
-      - '**'
-    tags:
-      - 'v*'
-  pull_request:
-    types: [opened, synchronize, closed]
-    branches:
-      - stage
-  delete:
 
 env:
   ZEROPS_API_BASE: https://api.app-prg1.zerops.io/api/rest/public
@@ -35,349 +20,171 @@ env:
   APP_SERVICE_NAME: app
   WORKER_SERVICE_NAME: worker
   ZEROPS_YAML_SETUP: prod
+  ZEROPS_OWNER_REPOSITORY: ${{ github.repository }}
+  ZEROPS_PROTECTED_NAMES: ${{ vars.ZEROPS_PROTECTED_NAMES }}
 
 jobs:
-  # --------------------------------------------------------------------------
-  # Job 1: Deploy dev environment (push to feature branch)
-  # --------------------------------------------------------------------------
-  deploy-dev:
-    if: >-
-      github.event_name == 'push'
-      && !startsWith(github.ref, 'refs/tags/')
-      && github.ref != 'refs/heads/main'
-      && github.ref != 'refs/heads/stage'
+  identity:
     runs-on: ubuntu-latest
-    concurrency:
-      group: zerops-dev-${{ github.ref }}
-      cancel-in-progress: true
-    env:
-      ZEROPS_TOKEN: ${{ secrets.ZEROPS_TOKEN }}
-      ZEROPS_CLIENT_ID: ${{ secrets.ZEROPS_CLIENT_ID }}
+    outputs:
+      key: ${{ steps.key.outputs.key }}
     steps:
-      - name: Checkout deployment repo
-        uses: actions/checkout@v4
-
-      - name: Checkout app repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          repository: ${{ env.APP_REPO }}
-          path: app
-          token: ${{ secrets.REPO_TOKEN || github.token }}
-
-      - name: Checkout worker repo
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.WORKER_REPO }}
-          path: worker
-          token: ${{ secrets.REPO_TOKEN || github.token }}
-
-      - name: Deploy to dev
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Compute case-sensitive environment lock
+        id: key
+        env:
+          EVENT: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+          REF: ${{ github.event_name == 'delete' && github.event.ref || github.ref_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          #!/usr/bin/env bash
           set -euo pipefail
           source zerops/scripts/zerops-api.sh
+          if [[ "$EVENT" == pull_request ]]; then
+            if [[ "$ACTION" == closed ]]; then key=stage; else key="pr-$PR_NUMBER"; fi
+          elif [[ "$GITHUB_REF" == refs/tags/* || "$REF" == main ]]; then
+            key=prod
+          else
+            key="branch-$(slugify "$REF")"
+          fi
+          printf 'key=%s\n' "$key" >> "$GITHUB_OUTPUT"
 
-          BRANCH_SLUG=$(slugify "${{ github.ref_name }}")
-          PROJECT_NAME="showcase-dev-${BRANCH_SLUG}"
-          echo "Project: ${PROJECT_NAME}"
-
-          zerops_render_template zerops/recipes/zerops-import.yml.tpl \
-            zerops/recipes/env-dev.env "$PROJECT_NAME"
-          zerops_ensure_project "$ZEROPS_CLIENT_ID" "$PROJECT_NAME" "" 300
-
-          zerops_find_service "$PROJECT_ID" "$APP_SERVICE_NAME"
-          zerops_deploy_service "$SERVICE_FOUND_ID" ./app ./app/zerops.yml "$ZEROPS_YAML_SETUP"
-
-          zerops_find_service "$PROJECT_ID" "$WORKER_SERVICE_NAME"
-          zerops_deploy_service "$SERVICE_FOUND_ID" ./worker ./worker/zerops.yml "$ZEROPS_YAML_SETUP"
-
-          zerops_get_subdomain_url "$PROJECT_ID" "$APP_SERVICE_NAME"
-          {
-            echo "### Deployed to Zerops (dev)"
-            echo ""
-            echo "**Project:** \`${PROJECT_NAME}\`"
-            if [[ -n "$SUBDOMAIN_URL" ]]; then
-              echo "**URL:** ${SUBDOMAIN_URL}"
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  # --------------------------------------------------------------------------
-  # Job 2: Deploy production (push to main or tag v*)
-  # --------------------------------------------------------------------------
-  deploy-prod:
+  deploy:
+    needs: identity
+    # Never run PR-controlled orchestration with deployment credentials, including fork PRs.
     if: >-
-      github.event_name == 'push'
-      && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+      (github.event_name == 'push' && github.ref != 'refs/heads/stage') ||
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository &&
+       ((github.event.action == 'closed' && github.event.pull_request.merged == true) ||
+        github.event.action != 'closed'))
     runs-on: ubuntu-latest
     concurrency:
-      group: zerops-prod
+      group: zerops-${{ github.repository }}-${{ needs.identity.outputs.key }}
       cancel-in-progress: false
-    env:
-      ZEROPS_TOKEN: ${{ secrets.ZEROPS_TOKEN }}
-      ZEROPS_CLIENT_ID: ${{ secrets.ZEROPS_CLIENT_ID }}
     steps:
-      - name: Checkout deployment repo
-        uses: actions/checkout@v4
-
-      - name: Checkout app repo
+      - name: Checkout trusted deployment orchestration
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.APP_REPO }}
-          path: app
-          token: ${{ secrets.REPO_TOKEN || github.token }}
+          ref: ${{ github.event_name == 'pull_request' && (github.event.action == 'closed' && github.event.pull_request.base.ref || github.event.pull_request.base.sha) || github.sha }}
+          persist-credentials: false
 
-      - name: Checkout worker repo
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.WORKER_REPO }}
-          path: worker
-          token: ${{ secrets.REPO_TOKEN || github.token }}
-
-      - name: Deploy to production
+      - name: Resolve and checkout service code
+        id: source
+        env:
+          GH_TOKEN: ${{ secrets.REPO_TOKEN || github.token }}
+          SOURCE_KIND: ${{ startsWith(github.ref, 'refs/tags/') && 'tag' || 'branch' }}
+          SOURCE_REF: ${{ github.event_name == 'pull_request' && (github.event.action == 'closed' && github.event.pull_request.base.ref || github.event.pull_request.head.ref) || github.ref_name }}
         run: |
-          #!/usr/bin/env bash
           set -euo pipefail
-          source zerops/scripts/zerops-api.sh
+          bash zerops/scripts/checkout-source.sh "$APP_REPO" app "$SOURCE_KIND" "$SOURCE_REF" app
+          bash zerops/scripts/checkout-source.sh "$WORKER_REPO" worker "$SOURCE_KIND" "$SOURCE_REF" worker
 
-          PROJECT_NAME="showcase-prod"
-          echo "Project: ${PROJECT_NAME}"
-
-          zerops_render_template zerops/recipes/zerops-import.yml.tpl \
-            zerops/recipes/env-prod.env "$PROJECT_NAME"
-          zerops_ensure_project "$ZEROPS_CLIENT_ID" "$PROJECT_NAME" "" 300
-
-          zerops_find_service "$PROJECT_ID" "$APP_SERVICE_NAME"
-          zerops_deploy_service "$SERVICE_FOUND_ID" ./app ./app/zerops.yml "$ZEROPS_YAML_SETUP"
-
-          zerops_find_service "$PROJECT_ID" "$WORKER_SERVICE_NAME"
-          zerops_deploy_service "$SERVICE_FOUND_ID" ./worker ./worker/zerops.yml "$ZEROPS_YAML_SETUP"
-
-          zerops_get_subdomain_url "$PROJECT_ID" "$APP_SERVICE_NAME"
-          {
-            echo "### Deployed to Zerops (production)"
-            echo ""
-            echo "**Project:** \`${PROJECT_NAME}\`"
-            if [[ -n "$SUBDOMAIN_URL" ]]; then
-              echo "**URL:** ${SUBDOMAIN_URL}"
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  # --------------------------------------------------------------------------
-  # Job 3: Deploy MR staging (PR opened or updated targeting stage)
-  # --------------------------------------------------------------------------
-  deploy-mr-staging:
-    if: >-
-      github.event_name == 'pull_request'
-      && github.event.action != 'closed'
-    runs-on: ubuntu-latest
-    concurrency:
-      group: zerops-mr-${{ github.event.pull_request.number }}
-      cancel-in-progress: true
-    env:
-      ZEROPS_TOKEN: ${{ secrets.ZEROPS_TOKEN }}
-      ZEROPS_CLIENT_ID: ${{ secrets.ZEROPS_CLIENT_ID }}
-    steps:
-      - name: Checkout deployment repo
-        uses: actions/checkout@v4
-
-      - name: Checkout app repo
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.APP_REPO }}
-          path: app
-          token: ${{ secrets.REPO_TOKEN || github.token }}
-
-      - name: Checkout worker repo
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.WORKER_REPO }}
-          path: worker
-          token: ${{ secrets.REPO_TOKEN || github.token }}
-
-      - name: Deploy MR staging
+      - name: Deploy environment
         id: deploy
+        env:
+          ZEROPS_TOKEN: ${{ secrets.ZEROPS_TOKEN }}
+          ZEROPS_CLIENT_ID: ${{ secrets.ZEROPS_CLIENT_ID }}
+          ZEROPS_ENV_KIND: ${{ github.event_name == 'pull_request' && (github.event.action == 'closed' && 'stage' || 'pr') || (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')) && 'prod' || 'branch' }}
+          ZEROPS_ENV_REF: ${{ github.event_name == 'pull_request' && (github.event.action == 'closed' && github.event.pull_request.base.ref || github.event.pull_request.number) || (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')) && 'main' || github.ref_name }}
+          APP_SHA: ${{ steps.source.outputs.app_sha }}
+          APP_REF: ${{ steps.source.outputs.app_ref }}
+          WORKER_SHA: ${{ steps.source.outputs.worker_sha }}
+          WORKER_REF: ${{ steps.source.outputs.worker_ref }}
         run: |
-          #!/usr/bin/env bash
           set -euo pipefail
           source zerops/scripts/zerops-api.sh
-
-          PR_NUMBER="${{ github.event.pull_request.number }}"
-          PROJECT_NAME="showcase-mr-${PR_NUMBER}"
-          echo "Project: ${PROJECT_NAME}"
-
-          zerops_render_template zerops/recipes/zerops-import.yml.tpl \
-            zerops/recipes/env-stage.env "$PROJECT_NAME"
+          case "$ZEROPS_ENV_KIND" in
+            branch) PROJECT_NAME="showcase-dev-$(slugify "$ZEROPS_ENV_REF")"; config=dev ;;
+            pr) PROJECT_NAME="showcase-mr-$ZEROPS_ENV_REF"; config=stage ;;
+            stage) PROJECT_NAME=showcase-stage; config=stage ;;
+            prod) PROJECT_NAME=showcase-prod; config=prod ;;
+          esac
+          zerops_render_template zerops/recipes/zerops-import.yml.tpl "zerops/recipes/env-$config.env" "$PROJECT_NAME"
           zerops_ensure_project "$ZEROPS_CLIENT_ID" "$PROJECT_NAME" "" 300
-
           zerops_find_service "$PROJECT_ID" "$APP_SERVICE_NAME"
-          zerops_deploy_service "$SERVICE_FOUND_ID" ./app ./app/zerops.yml "$ZEROPS_YAML_SETUP"
-
+          zerops_deploy_service "$SERVICE_FOUND_ID" ./app ./app/zerops.yaml "$ZEROPS_YAML_SETUP"
           zerops_find_service "$PROJECT_ID" "$WORKER_SERVICE_NAME"
           zerops_deploy_service "$SERVICE_FOUND_ID" ./worker ./worker/zerops.yml "$ZEROPS_YAML_SETUP"
-
+          zerops_find_service "$PROJECT_ID" "$APP_SERVICE_NAME"
+          zerops_enable_subdomain "$SERVICE_FOUND_ID"
           zerops_get_subdomain_url "$PROJECT_ID" "$APP_SERVICE_NAME"
-          echo "subdomain_url=${SUBDOMAIN_URL}" >> "$GITHUB_OUTPUT"
-
+          printf 'subdomain_url=%s\n' "$SUBDOMAIN_URL" >> "$GITHUB_OUTPUT"
           {
-            echo "### Deployed to Zerops (MR staging)"
-            echo ""
-            echo "**Project:** \`${PROJECT_NAME}\`"
-            if [[ -n "$SUBDOMAIN_URL" ]]; then
-              echo "**URL:** ${SUBDOMAIN_URL}"
-            fi
+            printf '### Deployed to Zerops\n\n**Project:** %s\n\n' "$PROJECT_NAME"
+            printf '**App:** %s at %s\n\n' "$APP_REF" "$APP_SHA"
+            printf '**Worker:** %s at %s\n\n' "$WORKER_REF" "$WORKER_SHA"
+            printf '**URL:** %s\n' "$SUBDOMAIN_URL"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Comment on PR with deploy URL
-        if: steps.deploy.outputs.subdomain_url != ''
+      - name: Update PR preview comment
+        if: github.event_name == 'pull_request' && github.event.action != 'closed'
         uses: actions/github-script@v7
+        env:
+          PREVIEW_URL: ${{ steps.deploy.outputs.subdomain_url }}
+          APP_SHA: ${{ steps.source.outputs.app_sha }}
+          APP_REF: ${{ steps.source.outputs.app_ref }}
+          WORKER_REF: ${{ steps.source.outputs.worker_ref }}
+          WORKER_SHA: ${{ steps.source.outputs.worker_sha }}
         with:
           script: |
-            const url = '${{ steps.deploy.outputs.subdomain_url }}';
             const marker = '<!-- zerops-mr-staging -->';
-            const body = `${marker}\n### Zerops MR Staging\n\n**Preview URL:** ${url}\n\n_Deployed from commit \`${{ github.event.pull_request.head.sha }}\`_`;
-
-            // Find existing comment to update (avoid spam)
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-            });
-            const existing = comments.find(c => c.body.includes(marker));
-
+            const body = `${marker}\n### Zerops MR Staging\n\n**Preview URL:** ${process.env.PREVIEW_URL}\n\n**App ref:** \`${process.env.APP_REF}\`\n**App commit:** \`${process.env.APP_SHA}\`\n\n**Worker ref:** \`${process.env.WORKER_REF}\`\n**Worker commit:** \`${process.env.WORKER_SHA}\``;
+            const args = {...context.repo, issue_number: context.issue.number};
+            const comments = await github.paginate(github.rest.issues.listComments, args);
+            const existing = comments.find(c => c.user.type === 'Bot' && c.body.includes(marker));
             if (existing) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: existing.id,
-                body,
-              });
+              await github.rest.issues.updateComment({...context.repo, comment_id: existing.id, body});
             } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body,
-              });
+              await github.rest.issues.createComment({...args, body});
             }
 
-  # --------------------------------------------------------------------------
-  # Job 4: Deploy stage (MR merged into stage)
-  # --------------------------------------------------------------------------
-  deploy-stage:
+  cleanup-pr:
+    needs: deploy
     if: >-
-      github.event_name == 'pull_request'
-      && github.event.action == 'closed'
-      && github.event.pull_request.merged == true
+      always() && github.event_name == 'pull_request' && github.event.action == 'closed' &&
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     concurrency:
-      group: zerops-stage
+      group: zerops-${{ github.repository }}-pr-${{ github.event.pull_request.number }}
       cancel-in-progress: false
-    env:
-      ZEROPS_TOKEN: ${{ secrets.ZEROPS_TOKEN }}
-      ZEROPS_CLIENT_ID: ${{ secrets.ZEROPS_CLIENT_ID }}
     steps:
-      - name: Checkout deployment repo
-        uses: actions/checkout@v4
-
-      - name: Checkout app repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          repository: ${{ env.APP_REPO }}
-          path: app
-          token: ${{ secrets.REPO_TOKEN || github.token }}
-
-      - name: Checkout worker repo
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.WORKER_REPO }}
-          path: worker
-          token: ${{ secrets.REPO_TOKEN || github.token }}
-
-      - name: Deploy to stage
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - name: Delete closed PR preview
+        env:
+          ZEROPS_TOKEN: ${{ secrets.ZEROPS_TOKEN }}
+          ZEROPS_CLIENT_ID: ${{ secrets.ZEROPS_CLIENT_ID }}
+          ZEROPS_ENV_KIND: pr
+          ZEROPS_ENV_REF: ${{ github.event.pull_request.number }}
         run: |
-          #!/usr/bin/env bash
           set -euo pipefail
           source zerops/scripts/zerops-api.sh
+          zerops_delete_project_by_name "$ZEROPS_CLIENT_ID" "showcase-mr-$ZEROPS_ENV_REF"
 
-          PROJECT_NAME="showcase-stage"
-          echo "Project: ${PROJECT_NAME}"
-
-          zerops_render_template zerops/recipes/zerops-import.yml.tpl \
-            zerops/recipes/env-stage.env "$PROJECT_NAME"
-          zerops_ensure_project "$ZEROPS_CLIENT_ID" "$PROJECT_NAME" "" 300
-
-          zerops_find_service "$PROJECT_ID" "$APP_SERVICE_NAME"
-          zerops_deploy_service "$SERVICE_FOUND_ID" ./app ./app/zerops.yml "$ZEROPS_YAML_SETUP"
-
-          zerops_find_service "$PROJECT_ID" "$WORKER_SERVICE_NAME"
-          zerops_deploy_service "$SERVICE_FOUND_ID" ./worker ./worker/zerops.yml "$ZEROPS_YAML_SETUP"
-
-          zerops_get_subdomain_url "$PROJECT_ID" "$APP_SERVICE_NAME"
-          {
-            echo "### Deployed to Zerops (stage)"
-            echo ""
-            echo "**Project:** \`showcase-stage\`"
-            if [[ -n "$SUBDOMAIN_URL" ]]; then
-              echo "**URL:** ${SUBDOMAIN_URL}"
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  # --------------------------------------------------------------------------
-  # Job 5: Cleanup MR staging (PR closed — merged or rejected)
-  # --------------------------------------------------------------------------
-  cleanup-mr:
-    needs: [deploy-stage]
-    if: >-
-      always()
-      && github.event_name == 'pull_request'
-      && github.event.action == 'closed'
+  cleanup-branch:
+    needs: identity
+    if: github.event_name == 'delete' && github.event.ref_type == 'branch' && github.event.ref != 'main' && github.event.ref != 'stage'
     runs-on: ubuntu-latest
     concurrency:
-      group: zerops-mr-${{ github.event.pull_request.number }}
+      group: zerops-${{ github.repository }}-${{ needs.identity.outputs.key }}
       cancel-in-progress: false
-    env:
-      ZEROPS_TOKEN: ${{ secrets.ZEROPS_TOKEN }}
-      ZEROPS_CLIENT_ID: ${{ secrets.ZEROPS_CLIENT_ID }}
     steps:
-      - name: Checkout deployment repo
-        uses: actions/checkout@v4
-
-      - name: Delete MR staging project
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Delete removed branch preview
+        env:
+          ZEROPS_TOKEN: ${{ secrets.ZEROPS_TOKEN }}
+          ZEROPS_CLIENT_ID: ${{ secrets.ZEROPS_CLIENT_ID }}
+          ZEROPS_ENV_KIND: branch
+          ZEROPS_ENV_REF: ${{ github.event.ref }}
         run: |
-          #!/usr/bin/env bash
           set -euo pipefail
           source zerops/scripts/zerops-api.sh
-
-          PR_NUMBER="${{ github.event.pull_request.number }}"
-          PROJECT_NAME="showcase-mr-${PR_NUMBER}"
-
-          echo "Cleaning up MR staging project: ${PROJECT_NAME}"
-          zerops_delete_project_by_name "$ZEROPS_CLIENT_ID" "$PROJECT_NAME"
-
-  # --------------------------------------------------------------------------
-  # Job 6: Cleanup dev environment (branch deleted)
-  # --------------------------------------------------------------------------
-  cleanup-dev:
-    if: >-
-      github.event_name == 'delete'
-      && github.event.ref_type == 'branch'
-    runs-on: ubuntu-latest
-    env:
-      ZEROPS_TOKEN: ${{ secrets.ZEROPS_TOKEN }}
-      ZEROPS_CLIENT_ID: ${{ secrets.ZEROPS_CLIENT_ID }}
-    steps:
-      - name: Checkout deployment repo
-        uses: actions/checkout@v4
-
-      - name: Delete dev project
-        run: |
-          #!/usr/bin/env bash
-          set -euo pipefail
-          source zerops/scripts/zerops-api.sh
-
-          # github.event.ref on delete event is the branch name (no refs/heads/ prefix)
-          BRANCH_SLUG=$(slugify "${{ github.event.ref }}")
-          PROJECT_NAME="showcase-dev-${BRANCH_SLUG}"
-
-          echo "Cleaning up dev project: ${PROJECT_NAME}"
-          zerops_delete_project_by_name "$ZEROPS_CLIENT_ID" "$PROJECT_NAME"
+          zerops_delete_project_by_name "$ZEROPS_CLIENT_ID" "showcase-dev-$(slugify "$ZEROPS_ENV_REF")"
