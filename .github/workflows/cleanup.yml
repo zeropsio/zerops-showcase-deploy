@@ -1,0 +1,67 @@
+name: Clean up stale Zerops previews
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Report eligible owned previews without deleting them
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+env:
+  ZEROPS_API_BASE: https://api.app-prg1.zerops.io/api/rest/public
+  ZEROPS_OWNER_REPOSITORY: ${{ github.repository }}
+  ZEROPS_PROTECTED_NAMES: ${{ vars.ZEROPS_PROTECTED_NAMES }}
+  PREVIEW_TTL_HOURS: ${{ vars.PREVIEW_TTL_HOURS || '168' }}
+
+jobs:
+  enumerate:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.previews.outputs.matrix }}
+      has_candidates: ${{ steps.previews.outputs.has_candidates }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Find owned expired or orphaned previews
+        id: previews
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ZEROPS_TOKEN: ${{ secrets.ZEROPS_TOKEN }}
+          ZEROPS_CLIENT_ID: ${{ secrets.ZEROPS_CLIENT_ID }}
+        run: bash zerops/scripts/cleanup-previews.sh enumerate
+
+  cleanup:
+    needs: enumerate
+    if: needs.enumerate.outputs.has_candidates == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.enumerate.outputs.matrix) }}
+    concurrency:
+      group: zerops-${{ github.repository }}-${{ matrix.kind }}-${{ matrix.key }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Recheck and remove eligible preview
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ZEROPS_TOKEN: ${{ secrets.ZEROPS_TOKEN }}
+          ZEROPS_CLIENT_ID: ${{ secrets.ZEROPS_CLIENT_ID }}
+          PREVIEW_NAME: ${{ matrix.name }}
+          ZEROPS_ENV_KIND: ${{ matrix.kind }}
+          ZEROPS_ENV_REF: ${{ matrix.ref }}
+          CLEANUP_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || 'false' }}
+        run: bash zerops/scripts/cleanup-previews.sh delete

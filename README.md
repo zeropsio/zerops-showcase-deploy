@@ -10,16 +10,16 @@ Here's what happens for each Git action:
 
 | You do this                 | Pipeline creates        | What gets deployed          | Lifetime                   |
 | --------------------------- | ----------------------- | --------------------------- | -------------------------- |
-| Push to a feature branch    | `showcase-dev-{branch}` | Full isolated environment   | Until branch is deleted    |
-| Open/update a PR to `stage` | `showcase-mr-{number}`  | Full isolated environment   | Until PR is closed         |
+| Push to a feature branch    | `showcase-dev-{slug}-{hash}` | Full isolated environment   | Until branch deletion or expiry |
+| Open/update/reopen a PR to `stage` | `showcase-mr-{number}`  | Full isolated environment   | Until PR closure or expiry |
 | Merge a PR into `stage`     | `showcase-stage`        | Redeploys app code only     | Permanent (data preserved) |
 | Push/merge to `main`        | `showcase-prod`         | Redeploys app code only     | Permanent (data preserved) |
 | Delete a feature branch     | —                       | Deletes the dev environment | —                          |
 | Close/merge a PR            | —                       | Deletes the MR environment  | —                          |
 
-**Permanent environments** (stage, prod) keep their databases, caches, queues, and storage across every deploy. Only your application code gets updated, so your data is never lost when you deploy.
+**Permanent environments** (stage, prod) reuse their existing infrastructure. Application deployments update the app and worker services. Test your migrations against retained data.
 
-**Ephemeral environments** (dev, MR) are created from scratch each time and deleted when no longer needed. Every developer gets their own isolated copy of the full stack.
+**Ephemeral environments** (dev, MR) are created on first deployment, reused on later deployments and deleted on closure, branch deletion or expiry.
 
 ## How It Works
 
@@ -47,14 +47,14 @@ This repo (deployment orchestrator)
 
 Your app repos (separate repositories)
 ├── your-org/your-app                  ← e.g. Bun/Node web app, has zerops.yaml
-└── your-org/your-worker               ← e.g. Python worker, has zerops.yaml
+└── your-org/your-worker               ← e.g. Python worker, has zerops.yml
 ```
 
 ### Pushing a Feature Branch
 
 1. GitHub Actions detects the push.
 2. The workflow checks out this repo plus your app repos.
-3. It calls the Zerops API to check if a project named `showcase-dev-{branch}` already exists.
+3. It looks up `showcase-dev-{slug}-{hash}`. The suffix is the first 10 hexadecimal characters of SHA-256 of the full, case-sensitive branch name.
 4. If not, it renders the import template (`zerops-import.yml.tpl`) with dev values (`env-dev.env`) and creates the project (PostgreSQL, Valkey/Redis, NATS, object storage, plus your app and worker services).
 5. It waits for all infrastructure services to be ready.
 6. It packages your app code into a tarball, uploads it to Zerops, and triggers a build and deploy.
@@ -63,10 +63,27 @@ Your app repos (separate repositories)
 
 If you push again to the same branch, the project already exists, so step 4 is skipped and it just redeploys your code.
 
+### Which application code gets deployed
+
+The app and worker repositories are resolved independently. For a PR, use its head branch name; for a branch push, use that branch; for stage, use `stage`; for a release tag, use the same tag. If that ref is absent in a service repository, use that repository's default branch. The workflow records the selected ref and exact commit SHA for each service in its summary and PR comment. Create matching branches in both service repositories when reviewing coordinated changes.
+
+The sample app uses `zerops.yaml`; the sample worker uses `zerops.yml`. Deployment calls use those exact paths.
+
+The workflow enables the app's public subdomain after deployment. The URL helper reads `zeropsSubdomainHost` and the service's HTTP port from the API; non-80 ports use `https://SERVICE-HOST-PORT.REGION.zerops.app`.
+
+### Ownership and expiry
+
+Creation imports the project, then persists four tags through `PUT /project/{id}`: `showcase-owner:OWNER/REPO`, `showcase-kind:KIND`, `showcase-ref:BASE64URL_REF` and `showcase-created:UNIX_SECONDS`. The import endpoint ignores `project.tagList`, so a separate update is required. The ref is unpadded base64url of the raw branch name or PR number; persistent environments use stable `stage` and `main` identities, including tagged production releases. Reuse and deletion require matching ownership; existing unmarked projects are not adopted automatically. A failed tag update stops deployment and leaves the project for manual review.
+
+The scheduled cleanup workflow removes owned previews when their PR is closed, their branch is gone, or their creation age exceeds `PREVIEW_TTL_HOURS` (a repository Actions variable, default 168 hours). Persistent environments are excluded. Manual cleanup dispatch defaults to dry-run. GitHub/API lookup failures stop cleanup instead of treating an inaccessible ref as deleted.
+
+Deletion also rejects `stage`, `prod`, names ending in `-stage` or `-prod`, and comma-separated names in `ZEROPS_PROTECTED_NAMES`. `ZEROPS_DELETE_DRY_RUN=true` performs ownership and protection checks without deleting anything.
+
+
 ### Deleting a Branch
 
 1. GitHub fires a `delete` event.
-2. The cleanup job finds the project by name and deletes it.
+2. The cleanup job verifies repository, environment kind and ref tags before deleting the project. Stage/prod names and unmarked projects are refused.
 3. All services, data, and resources are freed.
 
 ### Protecting Stage and Prod Data
@@ -81,7 +98,7 @@ Does a project with this name already exist?
 
 When it reuses an existing project, it only deploys new code to the app and worker services. The database, cache, queue, and storage services are never touched, and keep running with all their data intact.
 
-This has been verified end-to-end: after three successive deploys to stage and multiple deploys to production, every infrastructure service retained the exact same internal ID, proving the services were never deleted and recreated.
+Use `bash zerops/scripts/verify-redeploy.sh PROJECT_ID APP_CHECKOUT WORKER_CHECKOUT` after the first deployment to check data retention. It uploads a synthetic PNG, reads its PostgreSQL upload row and original object, redeploys both services, then checks all four infrastructure IDs, the same row and identical object bytes. Set `ZEROPS_OWNER_REPOSITORY`, `ZEROPS_ENV_KIND` and `ZEROPS_ENV_REF` to the environment being checked, alongside the API credentials. Run it only against a test environment you own.
 
 ## Zerops Concepts You Need to Know
 
@@ -104,7 +121,7 @@ If you're new to Zerops, here are the key concepts this pipeline uses:
 - A [Zerops](https://zerops.io) account
 - A GitHub repository for your deployment orchestrator (this repo)
 - One or more GitHub repositories containing your application code
-- Each app repo needs a `zerops.yaml` file (see [Zerops docs](https://docs.zerops.io))
+- Each app repo needs its build/run YAML. The sample app uses `zerops.yaml` and the worker uses `zerops.yml`; change the deploy paths if your repositories differ.
 
 ### Step 1: Get Your Zerops Credentials
 
@@ -287,11 +304,11 @@ And add a checkout step for the additional repo.
 
 #### 6. Change the project naming prefix
 
-The project names (`showcase-dev-*`, `showcase-stage`, `showcase-prod`, `showcase-mr-*`) are set in the workflow's deploy steps. Search for `showcase` and replace it with your project's name, e.g., `myapp-dev-*`, `myapp-stage`, and so on.
+The project names (`showcase-dev-*`, `showcase-stage`, `showcase-prod`, `showcase-mr-*`) are set in the workflow's deploy steps. Replace the name prefix there and set `ZEROPS_PROJECT_PREFIX` to the same prefix in the cleanup workflow. The sweep defaults to `showcase`. Keep the `showcase-*` ownership tag keys unchanged.
 
-### Step 5: Add `zerops.yaml` to Your App Repos
+### Step 5: Add Build/Run YAML to Your App Repos
 
-Each application repository needs a `zerops.yaml` in its root that tells Zerops how to build and run it. Example for a Node/Bun app:
+Each application repository needs a build/run YAML in its root. Match the workflow path to its actual filename (`zerops.yaml` for the sample app, `zerops.yml` for the worker). Example for a Node/Bun app:
 
 ```yaml
 zerops:
@@ -351,23 +368,21 @@ main (production)
 
 The workflow uses GitHub Actions concurrency groups to prevent race conditions:
 
-- `zerops-prod` — only one production deploy at a time, never cancelled
-- `zerops-stage` — only one stage deploy at a time, never cancelled
-- `zerops-dev-{branch}` — one deploy per branch, new pushes cancel in-progress deploys
-- `zerops-mr-{number}` — one deploy per PR, new pushes cancel in-progress deploys
+- `zerops-{repository}-prod`: production deployments.
+- `zerops-{repository}-stage`: stage deployments.
+- `zerops-{repository}-branch-{slug}-{hash}`: branch deployment, deletion and scheduled expiry. The case-sensitive digest keeps `feature/Foo` and `feature/foo` distinct even though GitHub compares concurrency groups without case.
+- `zerops-{repository}-pr-{number}`: PR deployment, closure cleanup and scheduled expiry.
 
-So if you push twice quickly to a feature branch, the first deploy is cancelled and only the second one runs.
+All groups use `cancel-in-progress: false`, so cleanup cannot cancel an import or race a deployment for the same environment. GitHub concurrency keeps at most one running and one pending job per group; later events can replace a pending job. Scheduled expiry catches missed cleanup events.
 
 ### Jobs
 
 | Job                 | Trigger                                     | What it does                                     |
 | ------------------- | ------------------------------------------- | ------------------------------------------------ |
-| `deploy-dev`        | Push to any branch (except `main`, `stage`) | Create/reuse dev project, deploy app + worker    |
-| `deploy-prod`       | Push to `main` or tag `v*`                  | Create/reuse prod project, deploy app + worker   |
-| `deploy-mr-staging` | PR opened/updated targeting `stage`         | Create/reuse MR project, deploy, post PR comment |
-| `deploy-stage`      | PR merged into `stage`                      | Create/reuse stage project, deploy app + worker  |
-| `cleanup-mr`        | PR closed (merged or rejected)              | Delete the MR project                            |
-| `cleanup-dev`       | Branch deleted                              | Delete the dev project                           |
+| `deploy` | Feature push, main/tag release, PR open/update/reopen or stage merge | Select the environment, create/reuse it, deploy app + worker |
+| `cleanup-pr` | PR closed, merged or rejected | Delete the owned MR project |
+| `cleanup-branch` | Branch deleted | Delete the owned dev project |
+| `enumerate` / `cleanup` | Hourly or manual cleanup workflow | Recheck and remove owned expired or orphaned previews |
 
 ## API Script Reference
 
@@ -405,13 +420,13 @@ If your project has only one deployable service (no separate worker), remove the
 ## FAQ
 
 **Q: What if I push to `main` directly instead of merging from `stage`?**
-A: The `deploy-prod` job fires on any push to `main`, including direct pushes. It works the same way.
+A: The `deploy` job selects production on any push to `main`, including direct pushes.
 
 **Q: What if two PRs are merged to `stage` at the same time?**
-A: The concurrency group `zerops-stage` serializes them. The second deploy waits for the first to finish.
+A: The repository-specific `zerops-{repository}-stage` concurrency group serializes them.
 
 **Q: What if I close a PR without merging?**
-A: The `cleanup-mr` job still runs, since it triggers on all PR closes. It deletes the MR staging project. The `deploy-stage` job is skipped because the PR wasn't merged.
+A: `cleanup-pr` runs for rejected and merged PRs. A rejected PR skips deployment and deletes only its owned MR preview.
 
 **Q: Can I use this with a monorepo instead of separate app repos?**
 A: Yes. Change the checkout steps to check out subdirectories of your monorepo, and point the `zerops_deploy_service` calls to the right directories.
